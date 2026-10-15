@@ -1,4 +1,4 @@
-"""VAGbit CAN Dashboard v0.4.3 - buffered CSV logging and fast live telemetry."""
+"""VAGbit CAN Dashboard v0.5.0 - telemetry health and low-latency gauges and buffered CSV logging and fast live telemetry."""
 import argparse
 import queue
 import csv
@@ -26,6 +26,15 @@ STATE = {
 SEEN = Counter()
 LATEST = {}
 RECENT = deque(maxlen=30)
+FRAME_TIMES = deque(maxlen=3000)
+DIAGNOSTICS = {'bad_timestamps': 0, 'timestamp_regressions': 0,
+               'serial_lines_too_long': 0, 'serial_bytes_waiting': 0,
+               'serial_read_errors': 0, 'rx_fps': 0.0, 'rpm_age_ms': None,
+               'serial_queue_age_ms': None}
+LAST_TIMESTAMP = None
+CLOCK_REFERENCE = None
+MAX_LINE_BYTES = 160
+
 
 # Write CSV on a separate thread; the CAN receive path never waits for disk I/O.
 LOG_DIR = ROOT / 'logs'
@@ -190,7 +199,7 @@ def parse_frame(line):
     try:
         timestamp = int(ts)
         count = int(dlc)
-        if not HEX_RE.fullmatch(can_id) or count < 0 or count > 8:
+        if timestamp < 0 or timestamp > 999999999 or not HEX_RE.fullmatch(can_id) or count < 0 or count > 8:
             return False
         if extended not in ('0', '1'):
             return False
@@ -251,7 +260,21 @@ def decode(ident, data, now):
             put(name, (data[byte] >> bit) & 1)
     return sig
 
+def diagnostic_snapshot():
+    now = time.monotonic()
+    with LOCK:
+        # Windowed instantaneous throughput instead of lifetime average.
+        while FRAME_TIMES and FRAME_TIMES[0] < now - 2.0:
+            FRAME_TIMES.popleft()
+        result = dict(DIAGNOSTICS)
+        result['rx_fps'] = round(len(FRAME_TIMES) / 2.0, 1)
+        rpm = STATE['signals'].get('rpm')
+        result['rpm_age_ms'] = round((now - rpm['at']) * 1000) if rpm else None
+    result['logging'] = log_snapshot()
+    return result
+
 def ingest(line):
+    global LAST_TIMESTAMP, CLOCK_REFERENCE
     if line.startswith('# STATS'):
         vals = dict(re.findall(r'(\w+)=(\d+)', line))
         with LOCK:
@@ -264,13 +287,25 @@ def ingest(line):
     if parsed is False:
         with LOCK:
             STATE['invalid'] += 1
+            if line and line[0].isdigit():
+                DIAGNOSTICS['bad_timestamps'] += 1 if not re.match(r'^\d{1,9},', line) else 0
         return
     timestamp, ident, extended, data = parsed
+    with LOCK:
+        if LAST_TIMESTAMP is not None and timestamp < LAST_TIMESTAMP and LAST_TIMESTAMP - timestamp < 100000000:
+            DIAGNOSTICS['timestamp_regressions'] += 1
+        LAST_TIMESTAMP = timestamp
+        # Estimate backlog relative to the ESP32 timestamp clock. Reset after discontinuities.
+        if CLOCK_REFERENCE is None or abs((now - CLOCK_REFERENCE[0]) * 1000 - (timestamp - CLOCK_REFERENCE[1])) > 15000:
+            CLOCK_REFERENCE = (now, timestamp)
+        delay_ms = (now - CLOCK_REFERENCE[0]) * 1000 - (timestamp - CLOCK_REFERENCE[1])
+        DIAGNOSTICS['serial_queue_age_ms'] = round(max(0, delay_ms)) if STATE['mode'] == 'serial' else None
     enqueue_frame(timestamp, ident, extended, data)
     frame = {'timestamp': timestamp, 'id': f'{ident:03X}', 'extended': extended,
              'dlc': len(data), 'data': ' '.join(f'{b:02X}' for b in data)}
     with LOCK:
         STATE['frames'] += 1
+        FRAME_TIMES.append(now)
         STATE['last_frame'] = now
         key = frame['id']
         SEEN[key] += 1
@@ -296,9 +331,18 @@ def serial_worker(port, baud):
                 STATE['mode'] = 'serial'
                 STATE['connection'] = f'Connected: {port} @ {baud}'
             while not STOP.is_set():
-                raw = conn.readline()
+                raw = conn.read_until(b'\n', MAX_LINE_BYTES)
                 if raw:
+                    if len(raw) >= MAX_LINE_BYTES and not raw.endswith(b'\n'):
+                        # Drain the remainder of an abnormally long line without accumulating memory.
+                        with LOCK:
+                            DIAGNOSTICS['serial_lines_too_long'] += 1
+                        while raw and not raw.endswith(b'\n') and not STOP.is_set():
+                            raw = conn.read_until(b'\n', MAX_LINE_BYTES)
+                        continue
                     ingest(raw.decode('ascii', errors='replace').strip())
+                with LOCK:
+                    DIAGNOSTICS['serial_bytes_waiting'] = conn.in_waiting
     except Exception as e:
         with LOCK:
             STATE['error'] = str(e)
@@ -376,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
                     'mode': STATE['mode'],
                     'connection': STATE['connection'],
                     'error': STATE['error'],
+                    'diagnostics': {'serial_bytes_waiting': DIAGNOSTICS['serial_bytes_waiting'],
+                                    'rpm_age_ms': round((time.monotonic() - STATE['signals']['rpm']['at']) * 1000) if 'rpm' in STATE['signals'] else None},
                 }
             result['age'] = round(time.monotonic() - result['last_frame'], 2) if result['last_frame'] else None
             self.respond(result)
@@ -389,7 +435,10 @@ class Handler(BaseHTTPRequestHandler):
                 state['unique'] = len(SEEN)
             state['age'] = round(time.monotonic() - state['last_frame'], 2) if state['last_frame'] else None
             state['logging'] = log_snapshot()
+            state['diagnostics'] = diagnostic_snapshot()
             self.respond(state)
+        elif path == '/api/diagnostics':
+            self.respond(diagnostic_snapshot())
         elif path == '/api/ports':
             try:
                 from serial.tools import list_ports
@@ -467,6 +516,13 @@ class Handler(BaseHTTPRequestHandler):
                 STATE['stats'] = {}
                 STATE['error'] = ''
                 STATE['last_frame'] = 0
+                FRAME_TIMES.clear()
+                DIAGNOSTICS.update(bad_timestamps=0, timestamp_regressions=0,
+                                   serial_lines_too_long=0, serial_bytes_waiting=0,
+                                   serial_queue_age_ms=None)
+                global LAST_TIMESTAMP, CLOCK_REFERENCE
+                LAST_TIMESTAMP = None
+                CLOCK_REFERENCE = None
             if kind == 'serial':
                 port = str(args.get('port', '')).strip()
                 baud = int(args.get('baud', BAUD))
@@ -498,7 +554,7 @@ def main():
     args = parser.parse_args()
     server = ThreadingHTTPServer(('127.0.0.1', args.http_port), Handler)
     url = f'http://127.0.0.1:{args.http_port}/'
-    print('VAGbit CAN Dashboard v0.4.1')
+    print('VAGbit CAN Dashboard v0.5.0')
     print('Dashboard:', url)
     print('Local only. No CAN frames are transmitted.')
     if args.replay:

@@ -83,3 +83,8 @@ Cancelled browser requests (Windows WinError 10053, 10054, broken pipe) are sile
 - Existing live recording remains a streamed CSV writer. Do not open a multi-GB CSV in Excel/Notepad while recording or playing back; use replay directly.
 
 The dashboard remains local-only and the ESP32/CAN interface is listen-only.
+
+
+## v0.5.0 Telemetry Health
+
+The new Telemetry Health panel displays live receive rate, RPM age, USB read backlog, timestamp problems, recording queue depth, and dropped recording frames. Start with live data without recording, then test a short 30-second recording. Do not operate the dashboard while driving. If Windows previously froze during recording, monitor CPU, memory, USB driver and disk load and avoid long unattended sessions until the cause has been established.
